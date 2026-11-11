@@ -40,6 +40,9 @@ struct Project {
     /// Optional command typed into a new session (e.g. "claude").
     #[serde(default)]
     start: Option<String>,
+    /// Keep a Claude Remote Control server (`<name>-remote` session) running in dir (`kale remote-up`).
+    #[serde(default)]
+    remote: bool,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +126,7 @@ struct Sess {
     project: String,
     slug: String,
     manual: bool,
+    remote: bool,
     attached: u32,
     activity: u64,
     windows: u32,
@@ -132,6 +136,9 @@ struct Sess {
 
 impl Sess {
     fn label(&self) -> String {
+        if self.remote {
+            return "Remote Control server: new sessions from the Claude app / claude.ai/code".into();
+        }
         match self.claude.iter().find_map(|c| c.name.clone()) {
             Some(n) => n,
             None => self.claude.iter().map(|c| c.topic.clone()).find(|t| !t.is_empty()).unwrap_or_default(),
@@ -182,7 +189,7 @@ fn list_sessions() -> Result<Vec<Sess>> {
     let out = match tmux(&[
         "list-sessions",
         "-F",
-        "#{session_id}\t#{session_name}\t#{@project}\t#{@slug}\t#{@manual}\t#{session_attached}\t#{session_activity}\t#{session_windows}\t#{session_path}",
+        "#{session_id}\t#{session_name}\t#{@project}\t#{@slug}\t#{@manual}\t#{session_attached}\t#{session_activity}\t#{session_windows}\t#{session_path}\t#{@remote}",
     ]) {
         Ok(o) => o,
         Err(e) if is_no_server(&e) => return Ok(vec![]),
@@ -192,12 +199,13 @@ fn list_sessions() -> Result<Vec<Sess>> {
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            (f.len() >= 9).then(|| Sess {
+            (f.len() >= 10).then(|| Sess {
                 id: f[0].into(),
                 name: f[1].into(),
                 project: f[2].into(),
                 slug: f[3].into(),
                 manual: !f[4].is_empty(),
+                remote: !f[9].is_empty(),
                 attached: f[5].parse().unwrap_or(0),
                 activity: f[6].parse().unwrap_or(0),
                 windows: f[7].parse().unwrap_or(1),
@@ -313,6 +321,40 @@ fn new_session(p: &Project, name: Option<&str>, existing: &[Sess]) -> Result<Str
         tmux(&["send-keys", "-t", &id, cmd, "Enter"])?;
     }
     Ok(id)
+}
+
+/// Ensure every `remote = true` project has a running Remote Control server session. Idempotent.
+fn remote_up(projects: &[Project]) -> Result<()> {
+    let all = list_sessions()?;
+    for p in projects.iter().filter(|p| p.remote) {
+        let cmd = format!(
+            "claude remote-control --spawn same-dir --permission-mode default --remote-control-session-name-prefix kale-{}",
+            p.name
+        );
+        if let Some(s) = all.iter().find(|s| s.remote && s.project == p.name) {
+            let fg = tmux(&["display", "-p", "-t", &s.id, "#{pane_current_command}"]).unwrap_or_default();
+            if fg.trim() == "claude" {
+                println!("{}: {} running", p.name, s.name);
+            } else {
+                tmux(&["send-keys", "-t", &s.id, &cmd, "Enter"])?;
+                println!("{}: {} had stopped; restarted", p.name, s.name);
+            }
+            continue;
+        }
+        let name = format!("{}-remote", p.name);
+        if all.iter().any(|s| s.name == name) {
+            println!("{}: a session named {name} exists but is not a remote server; skipped", p.name);
+            continue;
+        }
+        let dir = expand(&p.dir);
+        let id = tmux(&["new-session", "-d", "-P", "-F", "#{session_id}", "-s", &name, "-c", &dir])?.trim().to_string();
+        for (k, v) in [("@project", p.name.as_str()), ("@manual", "1"), ("@remote", "1")] {
+            tmux(&["set-option", "-t", &id, k, v])?;
+        }
+        tmux(&["send-keys", "-t", &id, &cmd, "Enter"])?;
+        println!("{}: started {name}", p.name);
+    }
+    Ok(())
 }
 
 /// Attach (blocking) and return when the client detaches or the session ends.
@@ -616,7 +658,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                     Span::styled(format!("{dot} "), Style::new().fg(dc)),
                     Span::styled(format!("{:<22}", s.name), Style::new().bold()),
                 ];
-                if !s.claude.is_empty() {
+                if s.remote {
+                    spans.push(Span::styled(" ⇄ remote  ", Style::new().fg(Color::Cyan)));
+                } else if !s.claude.is_empty() {
                     let (g, c) = if busy { ("◆ working", Color::Yellow) } else { ("◇ idle   ", Color::Blue) };
                     spans.push(Span::styled(format!(" {g} "), Style::new().fg(c)));
                 } else {
@@ -734,6 +778,7 @@ const HELP: &str = "kale — sessions on kale, one per terminal tab
   kale attach <session>    attach by exact name
   kale kill <session> [-y] kill by exact name
   kale projects            list projects (~/.config/kale/projects.toml)
+  kale remote-up           start missing Remote Control servers (projects with remote = true)
 ";
 
 fn print_ls() -> Result<()> {
@@ -751,7 +796,7 @@ fn print_ls() -> Result<()> {
         }
         println!("{g}");
         for s in ss {
-            let c = if s.claude.is_empty() { "shell" } else if s.claude.iter().any(|c| c.busy) { "working" } else { "idle" };
+            let c = if s.remote { "remote" } else if s.claude.is_empty() { "shell" } else if s.claude.iter().any(|c| c.busy) { "working" } else { "idle" };
             println!("  {:<24} {:<8} {:<9} {:>4}  {}", s.name, c, if s.attached > 0 { "attached" } else { "detached" }, ago(s.activity), s.label());
         }
     }
@@ -768,6 +813,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         ["ls" | "list"] => print_ls(),
+        ["remote-up"] => remote_up(&load_projects()?),
         ["projects"] => {
             for p in load_projects()? {
                 println!("{:<12} {}", p.name, p.dir);
