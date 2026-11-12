@@ -19,9 +19,11 @@ Host kale kale-tmux kale-tuccar kale-agents kale-lan kale-ts homeserver homeserv
   HostKeyAlias kale.local
   IdentityFile ~/.ssh/id_ed25519
   IdentitiesOnly yes
-  # One TCP connection per tab: a busy tab can't queue output ahead of another tab's keystrokes,
-  # and one dropped connection takes down one tab, not all of them. (Was ControlMaster auto.)
-  ControlMaster no
+  # All tabs share one TCP connection (decided by the Mac's ssh). Alternative: ControlMaster no
+  # gives each tab its own connection, so a busy tab can't queue output ahead of another tab's keystrokes.
+  ControlMaster auto
+  ControlPath ~/.ssh/sockets/%r@%h-%p
+  ControlPersist 10m
   ServerAliveInterval 30
   ServerAliveCountMax 3
 
