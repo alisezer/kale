@@ -2,7 +2,12 @@
 name = "kale"
 version = "0.1.0"
 edition = "2021"
-description = "Session manager for kale: projects + tmux sessions, one per terminal tab"
+description = "tmux session picker for a headless server driven over SSH: projects, one session per terminal tab, Claude Code aware"
+license = "MIT"
+repository = "https://github.com/alisezer/kale"
+readme = "README.md"
+keywords = ["tmux", "session-manager", "ssh", "claude-code", "tui"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

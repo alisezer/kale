@@ -63,3 +63,7 @@ kale remote-up           start missing Remote Control servers (run by kale-remot
   Without that, 6 attached tabs produced about 1.2 MB/s of full-screen repaints, which made typing over SSH lag.
 - Sessions are always targeted by id (`$N`), never by name, because tmux matches name prefixes.
 - To test against a throwaway tmux server, set `KALE_TMUX_SOCKET=<name>` (runs `tmux -L <name>`). Never test against the live server.
+
+## License
+
+MIT
