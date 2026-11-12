@@ -1,0 +1,9 @@
+[Unit]
+Description=kale: start/repair Remote Control servers at boot and every 10 min
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

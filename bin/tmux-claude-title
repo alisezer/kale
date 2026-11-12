@@ -1,0 +1,12 @@
+#!/bin/sh
+# Sets pane option @cc_name on every tmux pane running Claude Code: the session's /rename name if the user
+# set one, else "Claude Code". Source: ~/.claude/sessions/<pid>.json ("tmux" field ends in the pane id;
+# newest file wins). Run from status-right in ~/.tmux.conf every status-interval; prints nothing.
+tmux list-panes -a -F '#{pane_id} #{pane_current_command}' 2>/dev/null | while read -r pane cmd; do
+  [ "$cmd" = claude ] || continue
+  n=$(cat ~/.claude/sessions/*.json 2>/dev/null | jq -rs --arg p ".$pane" '
+    [.[] | select((.tmux // "") | endswith($p))] | sort_by(.updatedAt) | last
+    | if . != null and .nameSource == "user" and (.name // "") != "" then
+        (if (.name|length) > 32 then .name[0:31] + "…" else .name end) else empty end' 2>/dev/null)
+  tmux set -p -t "$pane" @cc_name "${n:-Claude Code}"
+done

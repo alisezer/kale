@@ -1,0 +1,9 @@
+[Unit]
+Description=kale: keep Claude Remote Control servers running (kale remote-up)
+Documentation=https://github.com/alisezer/kale
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/kale remote-up
+# remote-up may start the tmux server; only kill kale itself when the run ends, never tmux and its sessions
+KillMode=process

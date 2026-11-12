@@ -1,0 +1,13 @@
+# kale projects. name = session prefix (<name>-1, <name>-2, ...), dir = start folder.
+# Optional: start = "claude"  runs that command in every new session of the project.
+# Optional: remote = true     keeps a Claude Remote Control server (<name>-remote) running there (kale remote-up).
+
+[[project]]
+name = "agents"
+dir = "~/agents"
+remote = true
+
+[[project]]
+name = "tuccar"
+dir = "~/code/tuccar/main"
+remote = true

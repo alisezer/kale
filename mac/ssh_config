@@ -1,0 +1,39 @@
+# --- kale (home server, formerly "homeserver"; Ubuntu 26.04, set up 2026-11-11) ---
+# kale / kale-tmux pick the route automatically:
+#   at home (~/.ssh/at-home.sh: default gateway is the home Deco) -> direct LAN, kale.local
+#   anywhere else -> personal Tailscale (userspace tailscaled LaunchAgent io.sezer.tailscale-personal, SOCKS5 127.0.0.1:1055)
+# kale-lan / kale-ts force one route. The old homeserver* names still work as aliases.
+Match originalhost kale,kale-tmux,kale-tuccar,kale-agents,homeserver,homeserver-tmux exec "~/.ssh/at-home.sh"
+  HostName kale.local
+  ProxyCommand none
+
+Host kale kale-tmux kale-tuccar kale-agents kale-ts homeserver homeserver-tmux homeserver-ts
+  HostName 100.112.228.73
+  ProxyCommand nc -X 5 -x 127.0.0.1:1055 %h %p
+
+Host kale-lan homeserver-lan
+  HostName kale.local
+
+Host kale kale-tmux kale-tuccar kale-agents kale-lan kale-ts homeserver homeserver-tmux homeserver-lan homeserver-ts
+  User ali
+  HostKeyAlias kale.local
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+  # One TCP connection per tab: a busy tab can't queue output ahead of another tab's keystrokes,
+  # and one dropped connection takes down one tab, not all of them. (Was ControlMaster auto.)
+  ControlMaster no
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+
+Host kale-tmux homeserver-tmux
+  RequestTTY yes
+  RemoteCommand tmux new-session -A -s main
+
+# kale-tuccar / kale-agents: a new session in that kale project (kale session picker)
+Host kale-tuccar
+  RequestTTY yes
+  RemoteCommand ~/.local/bin/kale tuccar
+Host kale-agents
+  RequestTTY yes
+  RemoteCommand ~/.local/bin/kale agents
+# --- end kale ---
