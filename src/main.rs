@@ -870,6 +870,61 @@ fn selectable(r: &Row) -> bool {
     !matches!(r, Row::Header(..))
 }
 
+fn session_name_width(rows: &[Row], total_width: usize) -> usize {
+    let max_name = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Sess(s) => Some(s.name.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(22);
+    // Reserve space for: prefix (5) + gap (1) + status (11) + min gap (1) + right (~15) + right margin (1) = 34
+    let cap = total_width.saturating_sub(34).max(12);
+    max_name.max(22).min(cap)
+}
+
+fn format_sess_spans(s: &Sess, sess_no: usize, name_w: usize, total_width: usize) -> Vec<Span<'static>> {
+    let num = if sess_no <= 9 { format!("{sess_no}") } else { " ".into() };
+    let (dot, dc) = if s.attached > 0 { ("●", Color::Green) } else { ("○", Color::DarkGray) };
+    let busy = s.agents.iter().any(|a| a.busy);
+    let display_name = truncate_title(&s.name, name_w);
+    let mut spans = vec![
+        Span::styled(format!(" {num} "), Style::new().fg(Color::DarkGray)),
+        Span::styled(format!("{dot} "), Style::new().fg(dc)),
+        Span::styled(format!("{display_name:<name_w$} "), Style::new().bold()),
+    ];
+    if s.remote {
+        spans.push(Span::styled(" ⇄ remote  ", Style::new().fg(Color::Cyan)));
+    } else if !s.agents.is_empty() {
+        let (g, c) = if busy { ("◆ working", Color::Yellow) } else { ("◇ idle   ", Color::Blue) };
+        spans.push(Span::styled(format!(" {g} "), Style::new().fg(c)));
+    } else {
+        spans.push(Span::styled(" · shell   ", Style::new().fg(Color::DarkGray)));
+    }
+    let right = format!(
+        "{}{} {}",
+        if s.windows > 1 { format!("{}w ", s.windows) } else { String::new() },
+        if s.attached > 0 { "attached" } else { "detached" },
+        ago(s.activity)
+    );
+    // Exact display width of fixed columns:
+    // " {num} " (3) + "{dot} " (2) + "{display_name:<name_w$} " (name_w + 1) + status (11)
+    // + min_gap (1) + right + right_margin (1)
+    let used = 3 + 2 + (name_w + 1) + 11 + 1 + right.chars().count() + 1;
+    let mut label = s.label();
+    if s.project.is_empty() && label.is_empty() {
+        label = s.path.replace(&home().to_string_lossy().into_owned(), "~");
+    }
+    let room = total_width.saturating_sub(used);
+    let label = if room == 0 { String::new() } else { truncate_title(&label, room) };
+    let pad = room.saturating_sub(label.chars().count());
+    spans.push(Span::raw(label));
+    spans.push(Span::raw(" ".repeat(pad + 1)));
+    spans.push(Span::styled(right, Style::new().fg(Color::DarkGray)));
+    spans
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     let [top, body, foot] = Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(2)]).areas(f.area());
     let host = fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "kale".into());
@@ -881,6 +936,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         top,
     );
     let w = body.width as usize;
+    let name_w = session_name_width(&app.rows, w);
     let mut sess_no = 0;
     let items: Vec<ListItem> = app
         .rows
@@ -893,40 +949,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Row::New(_) => ListItem::new(Line::from(Span::styled("   + new session", Style::new().fg(Color::Cyan)))),
             Row::Sess(s) => {
                 sess_no += 1;
-                let num = if sess_no <= 9 { format!("{sess_no}") } else { " ".into() };
-                let (dot, dc) = if s.attached > 0 { ("●", Color::Green) } else { ("○", Color::DarkGray) };
-                let busy = s.agents.iter().any(|a| a.busy);
-                let mut spans = vec![
-                    Span::styled(format!(" {num} "), Style::new().fg(Color::DarkGray)),
-                    Span::styled(format!("{dot} "), Style::new().fg(dc)),
-                    Span::styled(format!("{:<22}", s.name), Style::new().bold()),
-                ];
-                if s.remote {
-                    spans.push(Span::styled(" ⇄ remote  ", Style::new().fg(Color::Cyan)));
-                } else if !s.agents.is_empty() {
-                    let (g, c) = if busy { ("◆ working", Color::Yellow) } else { ("◇ idle   ", Color::Blue) };
-                    spans.push(Span::styled(format!(" {g} "), Style::new().fg(c)));
-                } else {
-                    spans.push(Span::styled(" · shell   ", Style::new().fg(Color::DarkGray)));
-                }
-                let right = format!(
-                    "{}{} {}",
-                    if s.windows > 1 { format!("{}w ", s.windows) } else { String::new() },
-                    if s.attached > 0 { "attached" } else { "detached" },
-                    ago(s.activity)
-                );
-                let used = 4 + 2 + 22 + 11 + right.len() + 2;
-                let mut label = s.label();
-                if s.project.is_empty() && label.is_empty() {
-                    label = s.path.replace(&home().to_string_lossy().into_owned(), "~");
-                }
-                let room = w.saturating_sub(used);
-                let label: String = if label.chars().count() > room { label.chars().take(room.saturating_sub(1)).chain(['…']).collect() } else { label };
-                let pad = room.saturating_sub(label.chars().count());
-                spans.push(Span::raw(label));
-                spans.push(Span::raw(" ".repeat(pad + 1)));
-                spans.push(Span::styled(right, Style::new().fg(Color::DarkGray)));
-                ListItem::new(Line::from(spans))
+                ListItem::new(Line::from(format_sess_spans(s, sess_no, name_w, w)))
             }
         })
         .collect();
@@ -1034,6 +1057,7 @@ fn print_ls() -> Result<()> {
     let known: HashSet<&str> = projects.iter().map(|p| p.name.as_str()).collect();
     let mut groups: Vec<(String, Vec<&Sess>)> = projects.iter().map(|p| (p.name.clone(), all.iter().filter(|s| s.project == p.name).collect())).collect();
     groups.push(("other".into(), all.iter().filter(|s| !known.contains(s.project.as_str())).collect()));
+    let name_w = all.iter().map(|s| s.name.chars().count()).max().unwrap_or(24).max(24);
     for (g, ss) in groups {
         if ss.is_empty() {
             continue;
@@ -1041,7 +1065,7 @@ fn print_ls() -> Result<()> {
         println!("{g}");
         for s in ss {
             let c = if s.remote { "remote" } else if s.agents.is_empty() { "shell" } else if s.agents.iter().any(|a| a.busy) { "working" } else { "idle" };
-            println!("  {:<24} {:<8} {:<9} {:>4}  {}", s.name, c, if s.attached > 0 { "attached" } else { "detached" }, ago(s.activity), s.label());
+            println!("  {:<name_w$} {:<8} {:<9} {:>4}  {}", s.name, c, if s.attached > 0 { "attached" } else { "detached" }, ago(s.activity), s.label());
         }
     }
     Ok(())
@@ -1166,5 +1190,32 @@ mod tests {
 
         drop(con);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_row_aligns_long_names_without_overflow() {
+        let now_s = now();
+        let short = Sess { name: "tuccar-frontend".into(), attached: 0, activity: now_s, windows: 1, ..Default::default() };
+        let long = Sess { name: "tuccar-review-exa-work-progress".into(), attached: 1, activity: now_s, windows: 1, ..Default::default() };
+        let rows = vec![Row::Sess(short.clone()), Row::Sess(long.clone())];
+
+        let width = 100;
+        let name_w = session_name_width(&rows, width);
+        assert_eq!(name_w, "tuccar-review-exa-work-progress".len());
+
+        let s1: String = format_sess_spans(&short, 1, name_w, width).into_iter().map(|s| s.content.into_owned()).collect();
+        let s2: String = format_sess_spans(&long, 2, name_w, width).into_iter().map(|s| s.content.into_owned()).collect();
+        assert_eq!(s1.chars().count(), width - 1);
+        assert_eq!(s2.chars().count(), width - 1);
+        assert!(s2.ends_with("attached now"));
+        assert_eq!(s1.find("· shell"), s2.find("· shell"));
+
+        // Narrow terminal truncates the name instead of overflowing.
+        let narrow = 50;
+        let narrow_w = session_name_width(&rows, narrow);
+        let s3: String = format_sess_spans(&long, 2, narrow_w, narrow).into_iter().map(|s| s.content.into_owned()).collect();
+        assert_eq!(s3.chars().count(), narrow - 1);
+        assert!(s3.ends_with("attached now"));
+        assert!(s3.contains('…'));
     }
 }
