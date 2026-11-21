@@ -5,11 +5,11 @@ session, and most sessions run Claude Code.
 
 - **Session picker** (`src/`, Rust). Interactive SSH logins land in a picker. From there you attach to,
   start, rename or kill tmux sessions, grouped by project. `Alt+q` inside a session detaches back to it.
-  Sessions are called `<project>-<n>`, and are renamed to `<project>-<slug>` after a Claude Code `/rename`.
-- **tmux config** (`tmux/tmux.conf`). Status bar on top, tab titles that show the Claude Code session name,
+  Sessions are called `<project>-<n>`, and are renamed to `<project>-<slug>` after a Claude Code or Antigravity (`agy`) session rename.
+- **tmux config** (`tmux/tmux.conf`). Status bar on top, tab titles that show the Claude Code / Antigravity session name and busy/idle status,
   extended keys for Shift+Enter, OSC 52 clipboard.
-- **`bin/tmux-claude-title`**. Runs from the status bar and puts each Claude pane's `/rename` name into the
-  pane option `@cc_name`.
+- **`bin/tmux-claude-title`**. Runs from the status bar (throttled to 4 s) and calls `kale tmux-titles` to
+  put each Claude / Antigravity pane's name (and glyph for `agy`) into `@cc_name` and sync session renames.
 - **Remote Control** (`systemd/`). A user timer runs `kale remote-up` to keep a Claude Remote Control
   server running for every project marked `remote = true`.
 - **Mac side** (`mac/`). SSH aliases, a home-network check that picks LAN or Tailscale, and zsh shortcuts.

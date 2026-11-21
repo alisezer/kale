@@ -6,7 +6,7 @@
 //!   @manual   set when renamed by hand; disables auto-naming
 //! Sessions are always targeted by id ($N), never by name (names prefix-match in tmux).
 //!
-//! Env overrides (used by tests): KALE_TMUX_SOCKET (tmux -L), KALE_CLAUDE_SESSIONS, KALE_CONFIG.
+//! Env overrides (used by tests): KALE_TMUX_SOCKET (tmux -L), KALE_CLAUDE_SESSIONS, KALE_AGY_DIR, KALE_AGY_PANES, KALE_CONFIG.
 
 use anyhow::{bail, Context, Result};
 use ratatui::{
@@ -21,12 +21,13 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
     DefaultTerminal, Frame,
 };
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -112,10 +113,26 @@ fn tmux(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-#[derive(Clone, Default)]
-struct ClaudePane {
-    name: Option<String>, // user /rename name
-    topic: String,        // pane title without the status glyph
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentKind {
+    Claude,
+    Agy,
+}
+
+impl AgentKind {
+    fn display_name(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "Claude",
+            AgentKind::Agy => "Antigravity",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentPane {
+    kind: AgentKind,
+    name: Option<String>, // session rename/title used for autonaming & tab label
+    topic: String,        // fallback topic (e.g. Claude pane title without status glyph)
     busy: bool,
 }
 
@@ -131,7 +148,7 @@ struct Sess {
     activity: u64,
     windows: u32,
     path: String,
-    claude: Vec<ClaudePane>,
+    agents: Vec<AgentPane>,
 }
 
 impl Sess {
@@ -139,9 +156,24 @@ impl Sess {
         if self.remote {
             return "Remote Control server: new sessions from the Claude app / claude.ai/code".into();
         }
-        match self.claude.iter().find_map(|c| c.name.clone()) {
+        match self.agents.iter().find_map(|a| a.name.clone()) {
             Some(n) => n,
-            None => self.claude.iter().map(|c| c.topic.clone()).find(|t| !t.is_empty()).unwrap_or_default(),
+            None => self.agents.iter().map(|a| a.topic.clone()).find(|t| !t.is_empty()).unwrap_or_default(),
+        }
+    }
+
+    fn running_agents_label(&self) -> Option<String> {
+        let mut names: Vec<&'static str> = vec![];
+        for a in &self.agents {
+            let n = a.kind.display_name();
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        if names.is_empty() {
+            None
+        } else {
+            Some(names.join(" + "))
         }
     }
 }
@@ -180,6 +212,153 @@ fn claude_by_pane() -> HashMap<String, ClaudeInfo> {
     m
 }
 
+struct AgyInfo {
+    title: Option<String>,
+    busy: bool,
+}
+
+fn agy_dir() -> PathBuf {
+    env::var("KALE_AGY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".gemini/antigravity-cli"))
+}
+
+/// Optional test override: JSON object mapping tmux pane_id ("%1") -> agy conversation_id.
+fn agy_pane_overrides() -> HashMap<String, String> {
+    let Ok(path) = env::var("KALE_AGY_PANES") else { return HashMap::new() };
+    let Ok(text) = fs::read_to_string(path) else { return HashMap::new() };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Read Antigravity CLI conversation summaries (title + running/idle state) from its SQLite WAL DB read-only.
+fn agy_summaries(dir: &Path) -> HashMap<String, AgyInfo> {
+    let db = dir.join("conversation_summaries.db");
+    let mut m = HashMap::new();
+    let Ok(con) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX) else {
+        return m;
+    };
+    let _ = con.busy_timeout(Duration::from_millis(100));
+    let Ok(mut stmt) = con.prepare("SELECT conversation_id, title, status, not_fully_idle FROM conversation_summaries") else {
+        return m;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let status: String = row.get(2)?;
+        let not_idle: i64 = row.get(3).unwrap_or(0);
+        Ok((id, title, status, not_idle))
+    }) else {
+        return m;
+    };
+    for r in rows.flatten() {
+        let (id, title, status, not_idle) = r;
+        let t = title.trim().to_string();
+        let busy = status == "CASCADE_RUN_STATUS_RUNNING" || not_idle != 0;
+        m.insert(id, AgyInfo { title: (!t.is_empty()).then_some(t), busy });
+    }
+    m
+}
+
+/// Parse `title:"..."` from Antigravity's annotations/<conv_id>.pbtxt.
+fn parse_pbtxt_title(text: &str) -> Option<String> {
+    let idx = text.find("title:")?;
+    let rest = text[idx + "title:".len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                let trimmed = out.trim().to_string();
+                return (!trimmed.is_empty()).then_some(trimmed);
+            }
+            '\\' => match chars.next()? {
+                'n' => out.push(' '),
+                't' => out.push(' '),
+                'r' => {}
+                other => out.push(other),
+            },
+            _ => out.push(c),
+        }
+    }
+    None
+}
+
+fn agy_annotation_title(dir: &Path, conv_id: &str) -> Option<String> {
+    let text = fs::read_to_string(dir.join("annotations").join(format!("{conv_id}.pbtxt"))).ok()?;
+    parse_pbtxt_title(&text)
+}
+
+/// Walk descendants of `root_pid` via /proc to find the open Antigravity conversation lock (presence/<id>.lock).
+fn agy_conv_id_for_pid(root_pid: u32) -> Option<String> {
+    let mut queue = VecDeque::from([(root_pid, 0u8)]);
+    let mut seen = HashSet::from([root_pid]);
+    let mut fallback: Option<String> = None;
+
+    while let Some((pid, depth)) = queue.pop_front() {
+        if let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) {
+            for fd in fds.flatten() {
+                let Ok(target) = fs::read_link(fd.path()) else { continue };
+                let s = target.to_string_lossy();
+                if let Some(rest) = s.rsplit_once("/presence/").map(|(_, r)| r) {
+                    if let Some(id) = rest.strip_suffix(".lock") {
+                        if !id.is_empty() && !id.contains('/') {
+                            return Some(id.to_string());
+                        }
+                    }
+                } else if fallback.is_none() {
+                    if let Some(rest) = s.rsplit_once("/conversations/").map(|(_, r)| r) {
+                        if let Some(id) = rest.strip_suffix(".db") {
+                            if !id.is_empty() && !id.contains('/') {
+                                fallback = Some(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if depth >= 6 || seen.len() >= 64 {
+            continue;
+        }
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
+            for t in tasks.flatten() {
+                let Ok(children) = fs::read_to_string(t.path().join("children")) else { continue };
+                for tok in children.split_whitespace() {
+                    if let Ok(cpid) = tok.parse::<u32>() {
+                        if seen.insert(cpid) {
+                            queue.push_back((cpid, depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
+fn resolve_agy_pane(
+    pane_id: &str,
+    pane_pid: u32,
+    dir: &Path,
+    overrides: &HashMap<String, String>,
+    summaries: &HashMap<String, AgyInfo>,
+) -> (Option<String>, bool) {
+    let conv_id = overrides.get(pane_id).cloned().or_else(|| agy_conv_id_for_pid(pane_pid));
+    let Some(cid) = conv_id else { return (None, false) };
+    let db = summaries.get(&cid);
+    let title = agy_annotation_title(dir, &cid).or_else(|| db.and_then(|d| d.title.clone()));
+    let busy = db.is_some_and(|d| d.busy);
+    (title, busy)
+}
+
+fn truncate_title(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        s.chars().take(max_chars.saturating_sub(1)).chain(['…']).collect()
+    } else {
+        s.to_string()
+    }
+}
+
 fn is_no_server(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("no server running") || s.contains("error connecting") || s.contains("No such file")
@@ -210,34 +389,53 @@ fn list_sessions() -> Result<Vec<Sess>> {
                 activity: f[6].parse().unwrap_or(0),
                 windows: f[7].parse().unwrap_or(1),
                 path: f[8].into(),
-                claude: vec![],
+                agents: vec![],
             })
         })
         .collect();
-    let info = claude_by_pane();
     let panes = tmux(&[
         "list-panes",
         "-a",
         "-F",
-        "#{session_id}\t#{pane_id}\t#{pane_current_command}\t#{window_active}#{pane_active}\t#{pane_title}",
+        "#{session_id}\t#{pane_id}\t#{pane_current_command}\t#{window_active}#{pane_active}\t#{pane_pid}\t#{pane_title}",
     ])
     .unwrap_or_default();
-    let mut rows: Vec<Vec<&str>> = panes.lines().map(|l| l.splitn(5, '\t').collect()).filter(|f: &Vec<&str>| f.len() == 5).collect();
+    let mut rows: Vec<Vec<&str>> = panes.lines().map(|l| l.splitn(6, '\t').collect()).filter(|f: &Vec<&str>| f.len() == 6).collect();
     rows.sort_by_key(|f| f[3] != "11"); // active pane first, so it names the session
+
+    let has_claude = rows.iter().any(|f| f[2] == "claude");
+    let has_agy = rows.iter().any(|f| f[2] == "agy");
+    let claude_info = if has_claude { claude_by_pane() } else { HashMap::new() };
+    let agy_root = agy_dir();
+    let agy_overrides = if has_agy { agy_pane_overrides() } else { HashMap::new() };
+    let agy_info = if has_agy { agy_summaries(&agy_root) } else { HashMap::new() };
+
     for f in rows {
-        if f[2] != "claude" {
-            continue;
-        }
         let Some(s) = v.iter_mut().find(|s| s.id == f[0]) else { continue };
-        let ci = info.get(f[1]);
-        let mut topic = f[4].trim().to_string();
-        if topic.chars().next().is_some_and(|c| !c.is_alphanumeric()) {
-            topic = topic.chars().skip(1).collect::<String>().trim().to_string();
+        match f[2] {
+            "claude" => {
+                let ci = claude_info.get(f[1]);
+                let mut topic = f[5].trim().to_string();
+                if topic.chars().next().is_some_and(|c| !c.is_alphanumeric()) {
+                    topic = topic.chars().skip(1).collect::<String>().trim().to_string();
+                }
+                if topic == "Claude Code" {
+                    topic.clear();
+                }
+                s.agents.push(AgentPane {
+                    kind: AgentKind::Claude,
+                    name: ci.and_then(|c| c.name.clone()),
+                    topic,
+                    busy: ci.is_some_and(|c| c.busy),
+                });
+            }
+            "agy" => {
+                let pid = f[4].parse::<u32>().unwrap_or(0);
+                let (title, busy) = resolve_agy_pane(f[1], pid, &agy_root, &agy_overrides, &agy_info);
+                s.agents.push(AgentPane { kind: AgentKind::Agy, name: title, topic: String::new(), busy });
+            }
+            _ => {}
         }
-        if topic == "Claude Code" {
-            topic.clear();
-        }
-        s.claude.push(ClaudePane { name: ci.and_then(|c| c.name.clone()), topic, busy: ci.is_some_and(|c| c.busy) });
     }
     Ok(v)
 }
@@ -255,7 +453,7 @@ fn slug(s: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
-/// Project sessions follow their Claude /rename name: <project>-<slug>, -2/-3 on a clash.
+/// Project sessions follow their agent /rename or title: <project>-<slug>, -2/-3 on a clash.
 /// Returns true if anything was renamed.
 fn autoname(sessions: &[Sess]) -> bool {
     let mut taken: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
@@ -264,7 +462,7 @@ fn autoname(sessions: &[Sess]) -> bool {
         if s.project.is_empty() || s.manual {
             continue;
         }
-        let Some(n) = s.claude.iter().find_map(|c| c.name.clone()) else { continue };
+        let Some(n) = s.agents.iter().find_map(|a| a.name.clone()) else { continue };
         let sl = slug(&n);
         if sl.is_empty() || sl == s.slug {
             continue;
@@ -285,6 +483,51 @@ fn autoname(sessions: &[Sess]) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Update @cc_name on Claude and Antigravity tmux panes (only when changed, to avoid redraw storms)
+/// and sync project session auto-renames. Called by bin/tmux-claude-title from tmux status-right.
+fn tmux_titles() -> Result<()> {
+    let out = match tmux(&["list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_pid}\t#{@cc_name}"]) {
+        Ok(o) => o,
+        Err(e) if is_no_server(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let rows: Vec<Vec<&str>> = out.lines().map(|l| l.splitn(4, '\t').collect()).filter(|f: &Vec<&str>| f.len() == 4).collect();
+    let has_claude = rows.iter().any(|f| f[1] == "claude");
+    let has_agy = rows.iter().any(|f| f[1] == "agy");
+    let claude_info = if has_claude { claude_by_pane() } else { HashMap::new() };
+    let agy_root = agy_dir();
+    let agy_overrides = if has_agy { agy_pane_overrides() } else { HashMap::new() };
+    let agy_info = if has_agy { agy_summaries(&agy_root) } else { HashMap::new() };
+
+    for f in rows {
+        let (pane, cmd, cur) = (f[0], f[1], f[3]);
+        let want = match cmd {
+            "claude" => claude_info
+                .get(pane)
+                .and_then(|c| c.name.as_deref())
+                .map(|n| truncate_title(n, 32))
+                .unwrap_or_else(|| "Claude Code".into()),
+            "agy" => {
+                let pid = f[2].parse::<u32>().unwrap_or(0);
+                let (title, busy) = resolve_agy_pane(pane, pid, &agy_root, &agy_overrides, &agy_info);
+                let glyph = if busy { "◆" } else { "◇" };
+                let label = title.as_deref().map(|t| truncate_title(t, 32)).unwrap_or_else(|| "Antigravity".into());
+                format!("{glyph} {label}")
+            }
+            _ => continue,
+        };
+        if want != cur {
+            let _ = tmux(&["set", "-p", "-t", pane, "@cc_name", &want]);
+        }
+    }
+    if has_claude || has_agy {
+        if let Ok(all) = list_sessions() {
+            autoname(&all);
+        }
+    }
+    Ok(())
 }
 
 fn sessions() -> Result<Vec<Sess>> {
@@ -652,7 +895,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 sess_no += 1;
                 let num = if sess_no <= 9 { format!("{sess_no}") } else { " ".into() };
                 let (dot, dc) = if s.attached > 0 { ("●", Color::Green) } else { ("○", Color::DarkGray) };
-                let busy = s.claude.iter().any(|c| c.busy);
+                let busy = s.agents.iter().any(|a| a.busy);
                 let mut spans = vec![
                     Span::styled(format!(" {num} "), Style::new().fg(Color::DarkGray)),
                     Span::styled(format!("{dot} "), Style::new().fg(dc)),
@@ -660,7 +903,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 ];
                 if s.remote {
                     spans.push(Span::styled(" ⇄ remote  ", Style::new().fg(Color::Cyan)));
-                } else if !s.claude.is_empty() {
+                } else if !s.agents.is_empty() {
                     let (g, c) = if busy { ("◆ working", Color::Yellow) } else { ("◇ idle   ", Color::Blue) };
                     spans.push(Span::styled(format!(" {g} "), Style::new().fg(c)));
                 } else {
@@ -692,7 +935,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let prompt = match &app.mode {
         Mode::ConfirmKill(s) => {
-            let warn = if s.claude.is_empty() { String::new() } else { " — Claude is running in it".into() };
+            let warn = s.running_agents_label().map(|a| format!(" — {a} is running in it")).unwrap_or_default();
             Line::from(Span::styled(format!(" kill {}{warn}? y/N", s.name), Style::new().fg(Color::Red).bold()))
         }
         Mode::Rename(s, b) => Line::from(format!(" rename {} to: {}{}▏", s.name, if s.project.is_empty() { "" } else { &s.project }, if s.project.is_empty() { b.clone() } else { format!("-{b}") })),
@@ -779,6 +1022,7 @@ const HELP: &str = "kale — sessions on kale, one per terminal tab
   kale kill <session> [-y] kill by exact name
   kale projects            list projects (~/.config/kale/projects.toml)
   kale remote-up           start missing Remote Control servers (projects with remote = true)
+  kale tmux-titles         sync tmux tab labels (@cc_name) and session auto-renames for Claude/agy
 ";
 
 fn print_ls() -> Result<()> {
@@ -796,7 +1040,7 @@ fn print_ls() -> Result<()> {
         }
         println!("{g}");
         for s in ss {
-            let c = if s.remote { "remote" } else if s.claude.is_empty() { "shell" } else if s.claude.iter().any(|c| c.busy) { "working" } else { "idle" };
+            let c = if s.remote { "remote" } else if s.agents.is_empty() { "shell" } else if s.agents.iter().any(|a| a.busy) { "working" } else { "idle" };
             println!("  {:<24} {:<8} {:<9} {:>4}  {}", s.name, c, if s.attached > 0 { "attached" } else { "detached" }, ago(s.activity), s.label());
         }
     }
@@ -814,6 +1058,7 @@ fn main() -> Result<()> {
         }
         ["ls" | "list"] => print_ls(),
         ["remote-up"] => remote_up(&load_projects()?),
+        ["tmux-titles"] => tmux_titles(),
         ["projects"] => {
             for p in load_projects()? {
                 println!("{:<12} {}", p.name, p.dir);
@@ -827,7 +1072,7 @@ fn main() -> Result<()> {
         ["kill" | "k", name, rest @ ..] => {
             let s = find_exact(&sessions()?, name).with_context(|| format!("no session named {name}"))?;
             if !rest.contains(&"-y") {
-                let warn = if s.claude.is_empty() { "" } else { " (Claude is running in it)" };
+                let warn = s.running_agents_label().map(|a| format!(" ({a} is running in it)")).unwrap_or_default();
                 print!("kill {}{warn}? [y/N] ", s.name);
                 io::stdout().flush()?;
                 let mut l = String::new();
@@ -861,5 +1106,65 @@ fn main() -> Result<()> {
             eprint!("{HELP}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pbtxt_handles_plain_and_escaped() {
+        assert_eq!(parse_pbtxt_title(r#"title:"upgrade-merge""#), Some("upgrade-merge".into()));
+        assert_eq!(parse_pbtxt_title("title: \"Fix \\\"quoted\\\"\\\\path\"\n"), Some("Fix \"quoted\"\\path".into()));
+        assert_eq!(parse_pbtxt_title("title:\"  \""), None);
+        assert_eq!(parse_pbtxt_title("other:\"foo\""), None);
+    }
+
+    #[test]
+    fn truncate_title_preserves_unicode_and_bounds() {
+        assert_eq!(truncate_title("short", 32), "short");
+        let long = "a".repeat(40);
+        let t = truncate_title(&long, 32);
+        assert_eq!(t.chars().count(), 32);
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn agy_summaries_reads_wal_status_and_title() {
+        let dir = env::temp_dir().join(format!("kale-agy-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("annotations")).unwrap();
+        let db = dir.join("conversation_summaries.db");
+        let con = Connection::open(&db).unwrap();
+        con.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE conversation_summaries (
+               conversation_id TEXT PRIMARY KEY,
+               title TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL DEFAULT '',
+               not_fully_idle INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO conversation_summaries VALUES ('c1', 'upgrade-merge', 'CASCADE_RUN_STATUS_IDLE', 0);
+             INSERT INTO conversation_summaries VALUES ('c2', 'Casual Greeting', 'CASCADE_RUN_STATUS_RUNNING', 1);
+             INSERT INTO conversation_summaries VALUES ('c3', '', 'CASCADE_RUN_STATUS_IDLE', 1);",
+        )
+        .unwrap();
+        fs::write(dir.join("annotations/c1.pbtxt"), r#"title:"override-title""#).unwrap();
+
+        let summaries = agy_summaries(&dir);
+        assert_eq!(summaries["c1"].title.as_deref(), Some("upgrade-merge"));
+        assert!(!summaries["c1"].busy);
+        assert_eq!(summaries["c2"].title.as_deref(), Some("Casual Greeting"));
+        assert!(summaries["c2"].busy);
+        assert_eq!(summaries["c3"].title, None);
+        assert!(summaries["c3"].busy);
+
+        let overrides = HashMap::from([("%1".into(), "c1".into()), ("%2".into(), "c2".into())]);
+        assert_eq!(resolve_agy_pane("%1", 0, &dir, &overrides, &summaries), (Some("override-title".into()), false));
+        assert_eq!(resolve_agy_pane("%2", 0, &dir, &overrides, &summaries), (Some("Casual Greeting".into()), true));
+
+        drop(con);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

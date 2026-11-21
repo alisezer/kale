@@ -1,19 +1,13 @@
 #!/bin/sh
-# Sets pane option @cc_name on every tmux pane running Claude Code: the session's /rename name if the user
-# set one, else "Claude Code". Source: ~/.claude/sessions/<pid>.json ("tmux" field ends in the pane id;
-# newest file wins). Run from status-right in ~/.tmux.conf every status-interval; prints nothing.
+# Updates pane option @cc_name on tmux panes running Claude Code or Antigravity (agy),
+# and syncs project session auto-renames when an agent's session title changes.
+# Run from status-right in ~/.tmux.conf every status-interval; prints nothing.
 # tmux runs #() once per attached client, and every `tmux set` redraws every client in full, so:
-# run at most once per 4 s across all clients, and only set the option when the value changed.
+# run at most once per 4 s across all clients, and only set tmux options when the value changed.
 stamp="${XDG_RUNTIME_DIR:-/tmp}/tmux-claude-title.stamp"
 now=$(date +%s)
 [ "$((now - $(cat "$stamp" 2>/dev/null || echo 0)))" -lt 4 ] && exit 0
 echo "$now" > "$stamp"
-tmux list-panes -a -F '#{pane_id}	#{pane_current_command}	#{@cc_name}' 2>/dev/null | while IFS='	' read -r pane cmd cur; do
-  [ "$cmd" = claude ] || continue
-  n=$(cat ~/.claude/sessions/*.json 2>/dev/null | jq -rs --arg p ".$pane" '
-    [.[] | select((.tmux // "") | endswith($p))] | sort_by(.updatedAt) | last
-    | if . != null and .nameSource == "user" and (.name // "") != "" then
-        (if (.name|length) > 32 then .name[0:31] + "…" else .name end) else empty end' 2>/dev/null)
-  n="${n:-Claude Code}"
-  [ "$n" = "$cur" ] || tmux set -p -t "$pane" @cc_name "$n"
-done
+kale_bin="${HOME}/.local/bin/kale"
+[ -x "$kale_bin" ] || kale_bin="kale"
+exec "$kale_bin" tmux-titles >/dev/null 2>&1
