@@ -359,6 +359,26 @@ fn truncate_title(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Shorten Antigravity's auto-generated multi-word titles to at most 3 words (and <= 22 chars)
+/// for compact tmux tab labels and session slugs.
+fn short_agy_title(s: &str) -> String {
+    const MAX_WORDS: usize = 3;
+    const MAX_CHARS: usize = 22;
+    let mut out = String::new();
+    for (i, w) in s.split_whitespace().take(MAX_WORDS).enumerate() {
+        let wlen = w.chars().count();
+        if i == 0 {
+            out.push_str(w);
+        } else if out.chars().count() + 1 + wlen <= MAX_CHARS {
+            out.push(' ');
+            out.push_str(w);
+        } else {
+            break;
+        }
+    }
+    truncate_title(&out, MAX_CHARS)
+}
+
 fn is_no_server(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("no server running") || s.contains("error connecting") || s.contains("No such file")
@@ -462,8 +482,11 @@ fn autoname(sessions: &[Sess]) -> bool {
         if s.project.is_empty() || s.manual {
             continue;
         }
-        let Some(n) = s.agents.iter().find_map(|a| a.name.clone()) else { continue };
-        let sl = slug(&n);
+        let Some((kind, n)) = s.agents.iter().find_map(|a| a.name.as_deref().map(|n| (a.kind, n))) else { continue };
+        let sl = match kind {
+            AgentKind::Agy => slug(&short_agy_title(n)),
+            AgentKind::Claude => slug(n),
+        };
         if sl.is_empty() || sl == s.slug {
             continue;
         }
@@ -513,7 +536,7 @@ fn tmux_titles() -> Result<()> {
                 let pid = f[2].parse::<u32>().unwrap_or(0);
                 let (title, busy) = resolve_agy_pane(pane, pid, &agy_root, &agy_overrides, &agy_info);
                 let glyph = if busy { "◆" } else { "◇" };
-                let label = title.as_deref().map(|t| truncate_title(t, 32)).unwrap_or_else(|| "Antigravity".into());
+                let label = title.as_deref().map(short_agy_title).unwrap_or_else(|| "Antigravity".into());
                 format!("{glyph} {label}")
             }
             _ => continue,
@@ -1152,6 +1175,17 @@ mod tests {
         let t = truncate_title(&long, 32);
         assert_eq!(t.chars().count(), 32);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn short_agy_title_keeps_first_2_to_3_words() {
+        assert_eq!(short_agy_title("Kale UI Text Spacing Issue"), "Kale UI Text");
+        assert_eq!(short_agy_title("Create Antio Shortcut For Agy"), "Create Antio Shortcut");
+        assert_eq!(short_agy_title("Review Exa Work Progress"), "Review Exa Work");
+        assert_eq!(short_agy_title("Casual Greeting"), "Casual Greeting");
+        assert_eq!(short_agy_title("upgrade-merge"), "upgrade-merge");
+        assert_eq!(short_agy_title("Authentication Implementation Architecture"), "Authentication");
+        assert_eq!(short_agy_title("supercalifragilisticexpialidocious foo"), "supercalifragilistice…");
     }
 
     #[test]
